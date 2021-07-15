@@ -1,0 +1,140 @@
+name: Build and Test
+on: [push, pull_request]
+
+jobs:
+
+  generate-matrix:
+    name: Generate matrix for build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check changed files
+        id: diff
+        run: |
+          # See https://github.community/t/check-pushed-file-changes-with-git-diff-tree-in-github-actions/17220/10
+          if [ $GITHUB_BASE_REF ]; then
+            # Pull Request
+            git fetch origin $GITHUB_BASE_REF --depth=1
+            export DIFF=$( git diff --name-only origin/$GITHUB_BASE_REF $GITHUB_SHA )
+            echo "Diff between origin/$GITHUB_BASE_REF and $GITHUB_SHA"
+          else
+            # Push
+            git fetch origin ${{ github.event.before }} --depth=1
+            export DIFF=$( git diff --name-only ${{ github.event.before }} $GITHUB_SHA )
+            echo "Diff between ${{ github.event.before }} and $GITHUB_SHA"
+          fi
+          echo "$DIFF"
+          # Escape newlines (replace \n with %0A)
+          echo "::set-output name=diff::$( echo "$DIFF" | sed ':a;N;$!ba;s/\n/%0A/g' )"
+      - name: Set matrix for build
+        id: set-matrix
+        run: |
+          # Adapted from https://stackoverflow.com/a/62953566/11948346
+          DIFF="${{ steps.diff.outputs.diff }}"
+
+          JSON="{\"include\":["
+
+          image_versions () {
+            # Get version of image to test.
+            case $1 in
+              abricate)
+                ref_versions=(1.0.0)
+                ;;
+              ariba)
+                ref_versions=(2.14.4)
+                ;;
+              ivar)
+                ref_versions=(1.2.2_artic20200528)
+                ;;
+              mash)
+                ref_versions=(2.3)
+                ;;
+              mashtree)
+                ref_versions=(1.2.0)
+                ;;
+              metaphlan)
+                ref_versions=(3.0.3-no-db)
+                ;;
+              quast)
+                ref_versions=(5.0.2)
+                ;;
+              samtools)
+                ref_versions=(1.12)
+                ;;
+              shovill)
+                ref_versions=(1.1.0)
+                ;;
+              spades)
+                ref_versions=(3.15.2)
+                ;;
+              *)
+                ref_versions=()
+                ;;
+            esac
+          }
+
+          # Loop by lines
+          while read path; do
+            # Set $directory to substring before /
+            image="$( echo $path | cut -d'/' -f1 -s )"
+
+            case $image in
+              tests)
+                if [[ $path != *.sh ]]; then
+                  continue # Change happened to something that wasn't a shell script.
+                fi
+                image="$(basename $path .sh)"
+                image_versions $image
+                if [[ ${#ref_versions[@]} -eq 0 ]]; then
+                  continue # Test script doesn't have an associated version number.
+                fi
+                # Only test first version in array if test file has changed.
+                version="${ref_versions[0]}"
+                ;;
+              *)
+                if [[ $path != */Dockerfile ]]; then
+                  continue # Change happened to something that wasn't a Dockerfile.
+                fi
+                image_versions $image
+                if [[ ${#ref_versions[@]} -eq 0 ]]; then
+                  continue # Image that changed isn't part of the reference list.
+                fi
+                version="$( echo $path | cut -d'/' -f1 -s )"
+                if printf '%s\n' "${ref_versions[@]}" | grep -qvP "^${version}$"; then
+                  continue # Version of image that changed isn't a version we're testing.
+                fi
+                ;;
+            esac
+
+            # Add build to the matrix only if it is not already included
+            JSONline="{\"image\": \"$image\", \"version\": \"$version\"},"
+            if [[ "$JSON" != *"$JSONline"* ]]; then
+              JSON="$JSON$JSONline"
+            fi
+          done <<< "$DIFF"
+
+          # Remove last "," and add closing brackets
+          if [[ $JSON == *, ]]; then
+            JSON="${JSON%?}"
+          fi
+          JSON="$JSON]}"
+          echo $JSON
+
+          # Set output
+          echo "::set-output name=matrix::$( echo "$JSON" )"
+
+  build-and-test:
+    name: Build ${{ matrix.image }} version ${{ matrix.version }} and test it
+    needs: generate-matrix
+    if: contains(needs.generate-matrix.outputs.matrix, 'image')
+    strategy:
+      matrix: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Build ${{ matrix.image }} version ${{ matrix.version }}
+        run: docker build -t ${{ matrix.image }}:${{ matrix.version }} ${{ matrix.image }}/${{ matrix.version }}
+      - name: Test ${{ matrix.image }} version ${{ matrix.version }}
+        run: ./tests/${{ matrix.image }}.sh
